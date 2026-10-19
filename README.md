@@ -59,7 +59,7 @@ truth. Keep them identical.
 
 ```sh
 docker build -t my-tool:test .
-pip install jsonschema
+pip install jsonschema==4.26.0
 scripts/smoke-test.sh my-tool:test
 ```
 
@@ -81,7 +81,7 @@ prod.
 
 ## Things that will bite you
 
-- **Jobs must run as root.** The cache convention above and the smoke test both assume
+- **Jobs must run as root.** The cache convention below and the smoke test both assume
   it. The backend runs the job as the image's default `USER` unless the tool's
   `kubernetes_jobs` values set a `securityContext`. If your base image defaults to a
   non-root user (e.g. `mambaorg/micromamba` runs as uid 57439), set `runAsUser: 0` and

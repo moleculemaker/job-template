@@ -43,8 +43,9 @@ def main(output_dir: Path) -> int:
             errors.append("results.json differs from examples/expected/results.json")
         for name in artifacts:
             expected = expected_dir / name
-            if expected.is_file() and (output_dir / name).is_file() \
-                    and expected.read_bytes() != (output_dir / name).read_bytes():
+            if not expected.is_file():
+                errors.append(f"examples/expected/{name} is missing")
+            elif (output_dir / name).is_file() and expected.read_bytes() != (output_dir / name).read_bytes():
                 errors.append(f"{name} differs from examples/expected/{name}")
 
     for error in errors:
