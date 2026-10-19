@@ -6,14 +6,14 @@ set -euo pipefail
 image="${1:?usage: scripts/smoke-test.sh IMAGE}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# The container writes as root, so remove its output from inside a container
+trap 'docker run --rm -v "$work:/uws" --entrypoint rm "$image" -rf /uws/in /uws/out; rm -rf "$work"' EXIT
 
 mkdir -p "$work/in" "$work/out"
 cp "$root/examples/job.json" "$work/in/job.json"
 
-# Same env vars the backend sets; run as the current user so the output is removable
+# Same env vars and user (root) as the backend, so default cache paths under /root/.cache work
 docker run --rm \
-  --user "$(id -u):$(id -g)" \
   -e JOB_ID=smoke-test \
   -e JOB_TYPE=smoke-test \
   -e JOB_INPUT_DIR=/uws/in \

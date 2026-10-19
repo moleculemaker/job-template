@@ -10,9 +10,10 @@ example of the contract.
 
 ## The contract
 
-Through the backend's generic job path
-([mmli-backend#144](https://github.com/moleculemaker/mmli-backend/issues/144)), the
-image is launched with no command, so its `ENTRYPOINT` runs, with these environment
+This describes the backend's generic job path, which is **planned** in
+[mmli-backend#144](https://github.com/moleculemaker/mmli-backend/issues/144). Until it
+lands, tools need a per-tool branch in the backend as before. On that path the image is
+launched as root with no command, so its `ENTRYPOINT` runs, with these environment
 variables:
 
 | Variable | Meaning |
@@ -28,7 +29,8 @@ The container must:
    output schema. Large data (structures, tables, images) goes in separate files in the
    same directory, each listed in `results.json` under `artifacts`
    (`name`, `media_type`, optional `description`); the backend serves them by name.
-3. Exit non-zero on failure. A non-zero exit marks the job as failed.
+3. Exit non-zero on failure. A non-zero exit marks the job as failed, and nothing in
+   `JOB_OUTPUT_DIR` is uploaded, so a failed job has no output at all.
 
 `wrapper/entrypoint.py` implements this and should not need to change. Tool-specific
 code goes in `wrapper/tool.py`, whose `run(job, input_dir, output_dir)` returns the
@@ -82,8 +84,10 @@ prod.
 - **Don't use `/code` as the working directory.** The backend mounts its own config files
   under `/code/app/cfg` in the job container.
 - **Don't bake model weights into the image.** Large images exceed the CI runner's disk
-  and slow every pull on the cluster. Download weights at runtime into a cache directory
-  backed by the shared volume (configured per tool in the backend's values, as
-  SimpleFold does), so they are fetched once.
-- **Write `results.json` last.** The entrypoint does this for you; if you bypass it,
-  make sure a partial `results.json` can never be left behind after a failure.
+  and slow every pull on the cluster. Let libraries download weights at runtime to their
+  default cache under `/root/.cache` (e.g. `/root/.cache/huggingface`,
+  `/root/.cache/torch`). In the backend's values for the tool, mount the shared-volume
+  subpath `uws/jobs/<tool>/.cache` at `/root/.cache`, so weights are fetched once and
+  reused by later jobs. Don't write caches anywhere else.
+- **Don't return NaN or Infinity in results.** They aren't valid JSON; the entrypoint
+  refuses to write them and the job fails. Use `null` for missing values.

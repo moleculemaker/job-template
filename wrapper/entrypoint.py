@@ -21,10 +21,8 @@ def main() -> None:
     job = json.loads((input_dir / "job.json").read_text())
     results = tool.run(job, input_dir, output_dir)
 
-    # Written last and renamed into place, so results.json exists only if the tool finished
-    tmp = output_dir / "results.json.tmp"
-    tmp.write_text(json.dumps(results, indent=2) + "\n")
-    tmp.rename(output_dir / "results.json")
+    # allow_nan=False: NaN/Infinity are not JSON, and the browser's JSON.parse rejects them
+    (output_dir / "results.json").write_text(json.dumps(results, indent=2, allow_nan=False) + "\n")
 
 
 if __name__ == "__main__":
