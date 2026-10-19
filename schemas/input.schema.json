@@ -15,7 +15,12 @@
         "required": ["id", "sequence"],
         "additionalProperties": false,
         "properties": {
-          "id": {"type": "string", "minLength": 1},
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]*$",
+            "description": "Must start with a letter or digit, so it cannot be read as a spreadsheet formula when written to CSV."
+          },
           "sequence": {
             "type": "string",
             "pattern": "^[ACDEFGHIKLMNPQRSTVWYacdefghiklmnpqrstvwy]+$",
