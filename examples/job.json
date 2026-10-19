@@ -1,0 +1,6 @@
+{
+  "sequences": [
+    {"id": "insulin-b", "sequence": "FVNQHLCGSHLVEALYLVCGERGFFYTPKT"},
+    {"id": "glucagon", "sequence": "HSQGTFTSDYSKYLDSRRAQDFVQWLMNT"}
+  ]
+}

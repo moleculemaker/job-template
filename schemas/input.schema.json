@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sample tool input",
+  "description": "Protein sequences to measure.",
+  "type": "object",
+  "required": ["sequences"],
+  "additionalProperties": false,
+  "properties": {
+    "sequences": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "required": ["id", "sequence"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]*$",
+            "description": "Must start with a letter or digit, so it cannot be read as a spreadsheet formula when written to CSV."
+          },
+          "sequence": {
+            "type": "string",
+            "pattern": "^[ACDEFGHIKLMNPQRSTVWYacdefghiklmnpqrstvwy]+$",
+            "description": "One-letter amino acid codes; the 20 standard residues only."
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,2 @@
+# Runtime dependencies of the wrapper and the method, pinned to exact versions.
+# The sample tool uses only the standard library.
