@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sample tool results",
+  "description": "Shape of results.json. The frontend's result types are generated from this schema.",
+  "type": "object",
+  "required": ["rows", "artifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "length", "molecular_weight_da"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "length": {"type": "integer", "minimum": 1},
+          "molecular_weight_da": {"type": "number"}
+        }
+      }
+    },
+    "artifacts": {
+      "description": "Files in the output directory that the backend serves by name. Every tool's output schema keeps this property as-is.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "media_type"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+          "media_type": {"type": "string"},
+          "description": {"type": "string"}
+        }
+      }
+    }
+  }
+}

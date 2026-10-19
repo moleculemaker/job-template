@@ -1,0 +1,21 @@
+{
+  "rows": [
+    {
+      "id": "insulin-b",
+      "length": 30,
+      "molecular_weight_da": 3429.96
+    },
+    {
+      "id": "glucagon",
+      "length": 29,
+      "molecular_weight_da": 3482.79
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "results.csv",
+      "media_type": "text/csv",
+      "description": "All rows as CSV"
+    }
+  ]
+}
