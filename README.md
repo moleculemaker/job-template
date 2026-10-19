@@ -81,6 +81,11 @@ prod.
 
 ## Things that will bite you
 
+- **Jobs must run as root.** The cache convention above and the smoke test both assume
+  it. The backend runs the job as the image's default `USER` unless the tool's
+  `kubernetes_jobs` values set a `securityContext`. If your base image defaults to a
+  non-root user (e.g. `mambaorg/micromamba` runs as uid 57439), set `runAsUser: 0` and
+  `runAsGroup: 0` there, as SOMN does.
 - **Don't use `/code` as the working directory.** The backend mounts its own config files
   under `/code/app/cfg` in the job container.
 - **Don't bake model weights into the image.** Large images exceed the CI runner's disk
