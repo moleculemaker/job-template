@@ -72,6 +72,11 @@ GPU tools need a CPU code path (even a slow one) for the smoke test to run in CI
 method cannot run without a GPU, say so in the repo's README and rely on the GPU
 profiling run on the cluster instead.
 
+## GPU profiling
+
+Before a tool's schema limits are final, profile it on the mmli2 GPU node and write its
+capacity note. See [profiling/README.md](profiling/README.md).
+
 ## Images and releases
 
 `.github/workflows/build.yml` builds and smoke-tests every PR. Pushes to `main` publish
