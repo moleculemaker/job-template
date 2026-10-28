@@ -21,13 +21,19 @@ python3 gpu_profile.py run    --image ghcr.io/<org>/<tool>-job:sha-<short> --too
 ```
 
 `render` prints the manifest without touching the cluster. `run` checks the GPU first and
-refuses to start if anything blocks (below). Then it applies one ConfigMap and one Job in
-`staging`, waits, reads the results from the pod log, deletes both, and writes
-`out-<tool>/profile.json` and `profile.md`. You need kubectl access to mmli2 with
+refuses to start if anything blocks (below). Then it creates one ConfigMap and one Job in
+`staging`, follows the pod log as records arrive, deletes both, and writes
+`out-<tool>/profile.json` and `profile.md`. Records already printed survive a deadline
+kill; `profile.md` lists the sizes that didn't finish. You need kubectl access to mmli2 with
 create/delete on Jobs and ConfigMaps in `staging`.
 
-Use `--cpu`, `--memory` and `--shm` to match the tool's `kubernetes_jobs` values. If
-the whole series won't finish in two hours, raise `--deadline`.
+`--cpu` and `--memory` are requests, and `--cpu-limit` and `--memory-limit` are limits.
+They default to ml-simplefold's 4 CPU / 16Gi and 16 CPU / 32Gi, so the profile measures
+memory rather than capping it. Give `--shm` only if the tool's values will set
+`shmSizeLimit`; without it, like the backend, the pod gets the runtime's default 64Mi
+`/dev/shm`. If the whole series won't finish in two hours, raise `--deadline`. All inputs
+travel in one ConfigMap, which holds about 1 MiB; `run` refuses a larger series, so
+split it across runs.
 
 ## What blocks a run
 
@@ -47,16 +53,17 @@ DaemonSets, and chemscraper-services, which holds about 2.8 GB of the card aroun
 clock. `check` lists them as residents. They are always there, so their memory is in the
 baseline the measurement subtracts.
 
-The check runs once, before launch. Your Job requests the GPU, so GPU-requesting jobs
-submitted during the run wait behind it. A Job on the nvidia runtime without a GPU
-request can still start alongside it. If the numbers look off, look at what ran during
-the window.
+The check runs before launch and again every 10 s while the Job runs. Your Job requests
+the GPU, so GPU-requesting jobs submitted during the run wait behind it. A Job on the
+nvidia runtime without a GPU request can still start alongside it. If one does,
+`profile.json` lists it under `contended_by` and `profile.md` marks the profile as
+contended. Re-run when the GPU is idle.
 
 ## What is measured
 
 The Job mirrors how the backend launches a GPU tool. It uses the same node selector,
 toleration, runtime class, GPU request, root user, `/root/.cache` mount on the shared
-volume and `/dev/shm`, and it runs the same `python -m wrapper.entrypoint` on a
+volume and optional `/dev/shm`, and it runs the same `python -m wrapper.entrypoint` on a
 `job.json`. Each size runs as a fresh process, as each real job is a fresh pod, so every
 run pays model loading. Before the series, the smallest size runs once more without being
 measured, so a cold weight cache doesn't skew the first point. That first warm-up run is
@@ -68,7 +75,8 @@ For each size, `profile.json` records:
 |---|---|
 | `wall_s` | Time for the whole tool process |
 | `vram_baseline_mib`, `vram_peak_mib` | Card memory in use in the second before the run, and at its peak during it. Card-level (nvidia-smi every 200 ms), so the peak is a lower bound. Null if the image has no `nvidia-smi` or the tool doesn't use the GPU. |
-| `peak_rss_mib` | The tool process's peak host memory, for the memory request |
+| `mem_peak_mib` | The container's peak memory as its cgroup counts it, which is what the memory limit is checked against. It includes the tool's worker processes and `/dev/shm`, plus the driver and page cache, so it errs high. Use it for the memory request and limit. Null without a readable cgroup file. |
+| `peak_rss_mib` | The peak of the single largest tool process. It misses concurrent workers (DataLoader, multiprocessing), so don't size memory from it. |
 | `exit_code`, `log_tail` | The tool's exit code, and its last output if it failed |
 
 `profile.md` fits a straight line through the successful sizes:
@@ -76,6 +84,17 @@ For each size, `profile.json` records:
 part is process start, model load and setup. The per-item part is what each extra input
 costs. Check the R² value. If it is well below 1, the cost isn't linear in your chosen
 size: plot it before deriving limits from it.
+
+### Limits of the measurements
+
+- **VRAM is card-level.** The baseline is taken in the second before each size. Resident
+  services aren't constant: chemscraper-services' GPU use follows chemscraper jobs, which
+  run on CPU nodes the guard can't see. A spike inside a size's window counts as that
+  size's VRAM and can lengthen its time. Look for a size that is out of line with its
+  neighbors, and re-run it.
+- **Time is the tool process only.** A real job also pulls its image and runs the backend's
+  init and post-job containers, holding the GPU throughout. CAPACITY_NOTE.md accounts for
+  that.
 
 ## From profile to limits
 

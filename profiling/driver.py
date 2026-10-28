@@ -19,6 +19,9 @@ from pathlib import Path
 
 PROFILE_DIR = Path("/profile")
 WORK_DIR = Path("/tmp/profile")
+# The container's memory use as the OOM killer sees it: every process plus /dev/shm.
+# cgroup v2 first, then v1.
+CGROUP_MEMORY_FILES = ["/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"]
 
 
 class VramSampler:
@@ -61,7 +64,46 @@ class VramSampler:
         return [mib for t, mib in self.samples if start <= t <= end]
 
 
-def run_one(size, sampler):
+class MemorySampler:
+    """Samples the container's cgroup memory use (MiB) every `interval_s`.
+
+    ru_maxrss is one process's peak, so it misses DataLoader workers running alongside
+    the main process, and /dev/shm. The cgroup counts all of it, which is what a memory
+    limit is checked against. It also counts the driver and page cache, so it errs high.
+    """
+
+    def __init__(self, interval_s=0.2):
+        self.interval_s = interval_s
+        self.samples = []
+        self._path = next((p for p in CGROUP_MEMORY_FILES if os.path.exists(p)), None)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._path:
+            self._thread = threading.Thread(target=self._read, daemon=True)
+            self._thread.start()
+        return self
+
+    def _read(self):
+        while not self._stop.is_set():
+            try:
+                with open(self._path) as f:
+                    self.samples.append((time.monotonic(), int(f.read()) / 1024 / 1024))
+            except (OSError, ValueError):
+                pass
+            self._stop.wait(self.interval_s)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def between(self, start, end):
+        return [mib for t, mib in self.samples if start <= t <= end]
+
+
+def run_one(size, sampler, memory=None):
     job_dir = WORK_DIR / str(size)
     shutil.rmtree(job_dir, ignore_errors=True)
     (job_dir / "in").mkdir(parents=True)
@@ -81,13 +123,15 @@ def run_one(size, sampler):
 
     baseline = sampler.between(started - 1, started)
     during = sampler.between(started, ended)
+    memory_during = memory.between(started, ended) if memory else []
     # Not os.waitstatus_to_exitcode: that needs Python 3.9, and tool images can be older
     exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
     record = {
         "size": size,
         "wall_s": round(ended - started, 3),
         "exit_code": exit_code,
-        "peak_rss_mib": round(usage.ru_maxrss / 1024, 1),  # Linux reports KiB
+        "peak_rss_mib": round(usage.ru_maxrss / 1024, 1),  # Linux reports KiB; one process only
+        "mem_peak_mib": round(max(memory_during), 1) if memory_during else None,
         "vram_baseline_mib": min(baseline) if baseline else None,
         "vram_peak_mib": max(during) if during else None,
     }
@@ -99,13 +143,15 @@ def run_one(size, sampler):
 def main():
     sizes = json.loads((PROFILE_DIR / "sizes.json").read_text())
     sampler = VramSampler().start()
+    memory = MemorySampler().start()
     try:
-        warmup = run_one(sizes[0], sampler)
+        warmup = run_one(sizes[0], sampler, memory)
         print("PROFILE " + json.dumps(dict(warmup, warmup=True)), flush=True)
         for size in sizes:
-            print("PROFILE " + json.dumps(run_one(size, sampler)), flush=True)
+            print("PROFILE " + json.dumps(run_one(size, sampler, memory)), flush=True)
     finally:
         sampler.stop()
+        memory.stop()
 
 
 if __name__ == "__main__":

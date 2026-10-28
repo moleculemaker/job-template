@@ -5,7 +5,8 @@
       List what would block a run. Exits 1 if anything does.
   gpu_profile.py run --image IMAGE --tool TOOL --sizes 1,5,20,50,100 [--out DIR]
       Refuse to start if `check` finds a blocker, otherwise run every size in one Job
-      in the `staging` namespace, then write DIR/profile.json and DIR/profile.md.
+      in the `staging` namespace, then write DIR/profile.json and DIR/profile.md. Keeps
+      checking while it runs, and marks the profile contended if a GPU job starts.
   gpu_profile.py render ...same options as run...
       Print the manifest `run` would apply, without touching the cluster.
   gpu_profile.py capacity TOOLS.json
@@ -28,6 +29,9 @@ NAMESPACE = "staging"
 GPU_NODE_LABEL = "nvidia.com/gpu.present=true"
 GPU_RESOURCE = "nvidia.com/gpu"
 MULTIPLIERS = (1, 5, 10)
+PROFILE_LABEL = "gpu-profile"
+# A ConfigMap holds at most 1 MiB; leave room for the driver and metadata.
+CONFIGMAP_MAX_BYTES = 1_000_000
 
 
 # --- What blocks a profiling run ------------------------------------------------------
@@ -51,12 +55,13 @@ def gpu_blockers(pods):
     Two kinds, because GPU tools here use the GPU in two ways:
       - pods that request nvidia.com/gpu (ml-simplefold, ezspec-*): there is one GPU, so
         a running one holds it and a pending one is a user's job waiting for it;
-      - Job pods under runtimeClassName nvidia with no request (cleandb-mepesm and seven
-        other tools): they see the whole card without asking for it, so they share it
-        with the run and skew its time and memory.
+      - Job pods under runtimeClassName nvidia with no request (cleandb-mepesm and six
+        other tools in values.mmli2.prod.yaml): they see the whole card without asking
+        for it, so they share it with the run and skew its time and memory.
     Long-running pods under the nvidia runtime that aren't Jobs (gpu-operator DaemonSets,
     chemscraper-services) don't block. They are always there, so their memory is part of
-    the baseline the driver subtracts. resident_gpu_pods() lists them.
+    the baseline the driver subtracts. resident_gpu_pods() lists them. Their use isn't
+    constant, though: see "Limits of the measurements" in README.md.
     """
     blockers = []
     for pod in pods:
@@ -89,6 +94,13 @@ def _kubectl_json(*args):
     return json.loads(out)
 
 
+def _other_pods():
+    """Every pod except our own profiling pods, which request the GPU too. Used only while
+    a run is going; before it, a leftover profiling pod still blocks."""
+    return [p for p in _kubectl_json("get", "pods", "--all-namespaces")["items"]
+            if (p["metadata"].get("labels") or {}).get("app") != PROFILE_LABEL]
+
+
 def check():
     pods = _kubectl_json("get", "pods", "--all-namespaces")["items"]
     gpu_nodes = {n["metadata"]["name"] for n in _kubectl_json("get", "nodes", "-l", GPU_NODE_LABEL)["items"]}
@@ -108,15 +120,31 @@ def _indent(text, spaces):
     return "\n".join(" " * spaces + line for line in text.splitlines())
 
 
-def render_manifest(image, tool, sizes, name, make_job, cpu="4", memory="16Gi", shm="8Gi", deadline=7200):
-    """The ConfigMap (driver, sizes, one job.json per size) and Job for one run."""
+def render_manifest(image, tool, sizes, name, make_job, cpu="4", memory="16Gi",
+                    cpu_limit="16", memory_limit="32Gi", shm=None, deadline=7200):
+    """The ConfigMap (driver, sizes, one job.json per size) and Job for one run.
+
+    Defaults: requests like ml-simplefold's, limits like its 16 CPU / 32Gi, so a size that
+    would run in prod isn't OOMKilled here. No /dev/shm volume unless `shm` is given,
+    because the backend only adds one for tools whose values set shmSizeLimit.
+    """
     files = {"driver.py": (HERE / "driver.py").read_text(), "sizes.json": json.dumps(sizes)}
     for size in sizes:
         files[f"job-{size}.json"] = json.dumps(make_job(size))
+    total = sum(len(value.encode()) for value in files.values())
+    if total > CONFIGMAP_MAX_BYTES:
+        raise ValueError(f"The inputs come to {total} bytes, more than a ConfigMap holds (about 1 MiB). "
+                         "Profile fewer or smaller sizes per run, and fit across the runs.")
     data = "\n".join(f"  {key}: |\n{_indent(value, 4)}" for key, value in files.items())
+    shm_mount = shm_volume = ""
+    if shm:
+        shm_mount = "            - name: dshm\n              mountPath: /dev/shm\n"
+        shm_volume = (f"        - name: dshm\n          emptyDir:\n            medium: Memory\n"
+                      f"            sizeLimit: {shm}\n")
     return Template((HERE / "job.yaml").read_text()).substitute(
         name=name, namespace=NAMESPACE, configmap_data=data, image=image, tool=tool,
-        cpu=cpu, memory=memory, shm=shm, deadline=deadline)
+        cpu=cpu, memory=memory, cpu_limit=cpu_limit, memory_limit=memory_limit,
+        shm_mount=shm_mount, shm_volume=shm_volume, deadline=deadline)
 
 
 def parse_log(text):
@@ -125,10 +153,17 @@ def parse_log(text):
 
 
 def _wait(name, poll_s=10):
+    """Wait for the Job to end. Returns (succeeded, GPU jobs seen running alongside it).
+
+    The guard in run() only covers the start. A runtime-class tool that starts mid-run
+    shares the card and inflates later sizes, so keep looking and report what was seen.
+    """
+    contended = []
     while True:
         status = _kubectl_json("get", "job", name, "-n", NAMESPACE)["status"]
         if status.get("succeeded") or status.get("failed"):
-            return bool(status.get("succeeded"))
+            return bool(status.get("succeeded")), contended
+        contended += [b for b in gpu_blockers(_other_pods()) if b not in contended]
         time.sleep(poll_s)
 
 
@@ -138,19 +173,26 @@ def run(args):
     from inputs import make_job
     sizes = sorted({int(s) for s in args.sizes.split(",")})
     name = f"gpu-profile-{args.tool}-{int(time.time())}"
-    manifest = render_manifest(args.image, args.tool, sizes, name, make_job, args.cpu, args.memory, args.shm, args.deadline)
-    subprocess.run(["kubectl", "apply", "-f", "-"], input=manifest, text=True, check=True)
+    manifest = render_manifest(args.image, args.tool, sizes, name, make_job, args.cpu, args.memory,
+                               args.cpu_limit, args.memory_limit, args.shm, args.deadline)
+    # create, not apply: apply copies the whole object into an annotation capped at 256 KiB
+    subprocess.run(["kubectl", "create", "-f", "-"], input=manifest, text=True, check=True)
     try:
-        ok = _wait(name)
-        log = subprocess.run(["kubectl", "logs", f"job/{name}", "-n", NAMESPACE],
-                             capture_output=True, text=True).stdout
+        # Follow the log from the start. At the deadline the Job controller deletes the
+        # pod, and its log with it, so reading it afterwards would lose every record.
+        logs = subprocess.Popen(["kubectl", "logs", "-f", f"job/{name}", "-n", NAMESPACE,
+                                 f"--pod-running-timeout={args.deadline}s"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        ok, contended = _wait(name)
+        log = logs.communicate(timeout=120)[0]
     finally:
         subprocess.run(["kubectl", "delete", "job,configmap", name, "-n", NAMESPACE, "--wait=false"], check=False)
     records = parse_log(log)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "profile.json").write_text(json.dumps({"image": args.image, "tool": args.tool, "records": records}, indent=2) + "\n")
-    (out / "profile.md").write_text(report(records, args.image))
+    (out / "profile.json").write_text(json.dumps({"image": args.image, "tool": args.tool, "sizes": sizes,
+                                                  "contended_by": contended, "records": records}, indent=2) + "\n")
+    (out / "profile.md").write_text(report(records, args.image, sizes, contended))
     print((out / "profile.md").read_text())
     if not ok:
         sys.exit("The profiling Job failed; records up to the failure are above.")
@@ -175,19 +217,27 @@ def fit(points):
     return fixed, per_item, (1 - ss_res / ss_tot) if ss_tot else 1.0
 
 
-def report(records, image):
+def report(records, image, sizes=None, contended=()):
     """Markdown summary of a run: a row per size and the fitted fixed/per-item costs."""
     measured = [r for r in records if not r.get("warmup")]
-    lines = [f"# Profile of `{image}`", "",
-             "| size | wall (s) | VRAM peak (MiB) | VRAM over baseline (MiB) | peak RSS (MiB) | exit |",
-             "|---:|---:|---:|---:|---:|---:|"]
+    lines = [f"# Profile of `{image}`", ""]
+    if contended:
+        lines += ["**Contended:** these GPU jobs ran during the profile, so later sizes may be inflated. "
+                  "Re-run when the GPU is idle.", ""] + [f"- {c}" for c in contended] + [""]
+    lines += ["| size | wall (s) | VRAM peak (MiB) | VRAM over baseline (MiB) | memory peak, cgroup (MiB) "
+              "| peak RSS, one process (MiB) | exit |",
+              "|---:|---:|---:|---:|---:|---:|---:|"]
     for r in measured:
         over = (r["vram_peak_mib"] - r["vram_baseline_mib"]
                 if r.get("vram_peak_mib") is not None and r.get("vram_baseline_mib") is not None else None)
         lines.append(f'| {r["size"]} | {r["wall_s"]} | {_fmt(r.get("vram_peak_mib"))} | {_fmt(over)} '
-                     f'| {r["peak_rss_mib"]} | {r["exit_code"]} |')
+                     f'| {_fmt(r.get("mem_peak_mib"))} | {r["peak_rss_mib"]} | {r["exit_code"]} |')
     ok = [r for r in measured if r["exit_code"] == 0]
     lines.append("")
+    unfinished = [s for s in (sizes or []) if s not in {r["size"] for r in measured}]
+    if unfinished:
+        lines.append(f"- **Did not finish: {', '.join(map(str, unfinished))}.** The Job ended first: "
+                     "it hit its deadline, or the pod was OOMKilled or evicted.")
     if len({r["size"] for r in ok}) < 2:
         lines.append("Fewer than two sizes succeeded, so fixed and per-item costs can't be separated.")
         return "\n".join(lines) + "\n"
@@ -252,9 +302,12 @@ def _run_args(sub):
     sub.add_argument("--image", required=True, help="e.g. ghcr.io/moleculemaker/<tool>-job:sha-abc1234")
     sub.add_argument("--tool", required=True, help="the tool's job type, e.g. ezkinetics")
     sub.add_argument("--sizes", required=True, help="comma-separated input sizes, e.g. 1,5,20,50,100")
-    sub.add_argument("--cpu", default="4")
-    sub.add_argument("--memory", default="16Gi")
-    sub.add_argument("--shm", default="8Gi")
+    sub.add_argument("--cpu", default="4", help="CPU request")
+    sub.add_argument("--memory", default="16Gi", help="memory request")
+    sub.add_argument("--cpu-limit", default="16")
+    sub.add_argument("--memory-limit", default="32Gi")
+    sub.add_argument("--shm", default=None,
+                     help="mount /dev/shm of this size, as the backend does for a tool whose values set shmSizeLimit")
     sub.add_argument("--deadline", type=int, default=7200, help="activeDeadlineSeconds for the whole run")
     sub.add_argument("--out", default="profile-out")
 
@@ -276,7 +329,7 @@ def main():
         from inputs import make_job
         sizes = sorted({int(s) for s in args.sizes.split(",")})
         print(render_manifest(args.image, args.tool, sizes, f"gpu-profile-{args.tool}-render", make_job,
-                              args.cpu, args.memory, args.shm, args.deadline))
+                              args.cpu, args.memory, args.cpu_limit, args.memory_limit, args.shm, args.deadline))
     if args.command == "capacity":
         print(capacity_table(json.loads(Path(args.tools).read_text())))
 

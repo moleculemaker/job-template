@@ -26,7 +26,8 @@ its profile.
 The GPU serves jobs that request it one at a time. List every tool that requests
 `nvidia.com/gpu` (today ml-simplefold, ezspec-unidock and ezspec-inference), plus the new
 one, in a JSON file. Tools on the nvidia runtime without a GPU request don't queue, so
-leave them out. Their memory goes in the budget above instead.
+leave them out. Their memory comes off the GPU memory budget instead (see "From profile
+to limits" in profiling/README.md).
 
 ```json
 [
@@ -41,9 +42,18 @@ leave them out. Their memory goes in the budget above instead.
   backend's `GET /internal/reports/usage?from=…&to=…` (`by_tool[].jobs` ÷ days). For the
   new tool, an estimate. Say where it came from.
 - `service_s` and `service_sd_s`: the mean and standard deviation of how long a job holds
-  the GPU. For the new tool, take them from the profile at a typical input size. For
-  existing tools, use the `job` container's run times from recent pods. The backend
-  doesn't record start times yet, so `started_at` is empty.
+  the GPU. A pod that requests the GPU holds it from the moment it's scheduled until it
+  terminates: image pull (`imagePullPolicy: Always`), the init container's download, the
+  tool, then post-job's upload. So measure the whole pod, not just the tool:
+  - existing tools: from recent pods, the time from the `PodScheduled` condition to the
+    last container's `finishedAt` (`kubectl get pod -o json`);
+  - the new tool: its profiled `wall_s` at a typical size, plus that same overhead
+    (scheduled-to-finished minus the `job` container's run time) taken from an existing
+    GPU tool's pods.
+
+  Leaving out the overhead understates utilization, and at 5× or 10× that can turn an
+  unbounded queue into a finite-looking wait. The backend doesn't record start times yet,
+  so `started_at` is empty.
 
 Then run:
 

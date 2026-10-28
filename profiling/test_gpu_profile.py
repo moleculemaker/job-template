@@ -194,5 +194,137 @@ class TestDriver(unittest.TestCase):
             self.assertIn("KeyError", r["log_tail"])
 
 
+class TestManifestSettings(unittest.TestCase):
+    def render(self, **kw):
+        return gp.render_manifest("img", "t", [1, 5], "gpu-profile-t-1", make_job, **kw)
+
+    def test_no_shm_volume_unless_asked_like_the_backend(self):
+        """The backend mounts /dev/shm only for tools whose values set shmSizeLimit."""
+        self.assertNotIn("mountPath: /dev/shm", self.render())
+        text = self.render(shm="4Gi")
+        self.assertIn("mountPath: /dev/shm", text)
+        self.assertIn("sizeLimit: 4Gi", text)
+
+    def test_requests_and_limits_are_set_separately(self):
+        text = self.render(cpu="4", memory="24Gi", cpu_limit="16", memory_limit="32Gi")
+        limits, requests = text.split("limits:")[1].split("requests:")
+        self.assertIn('memory: "32Gi"', limits)
+        self.assertIn('cpu: "16"', limits)
+        self.assertIn('memory: "24Gi"', requests)
+
+    def test_inputs_too_large_for_a_configmap_are_refused_before_anything_is_created(self):
+        big = lambda size: {"sequences": [{"id": str(i), "sequence": "A" * 1000} for i in range(size)]}
+        with self.assertRaisesRegex(ValueError, "ConfigMap"):
+            gp.render_manifest("img", "t", [1, 2000], "gpu-profile-t-1", big)
+
+
+FAKE_KUBECTL = r"""#!/usr/bin/env python3
+import json, os, sys
+state = os.environ["FAKE_KUBECTL_DIR"]
+args = sys.argv[1:]
+with open(os.path.join(state, "calls.log"), "a") as f:
+    f.write(" ".join(args) + "\n")
+scenario = json.load(open(os.path.join(state, "scenario.json")))
+def count(key):
+    path = os.path.join(state, key)
+    n = int(open(path).read()) if os.path.exists(path) else 0
+    open(path, "w").write(str(n + 1))
+    return n
+if args[:2] == ["get", "pods"]:
+    n = count("pods")
+    print(json.dumps({"items": scenario["pods"][min(n, len(scenario["pods"]) - 1)]}))
+elif args[:2] == ["get", "nodes"]:
+    print(json.dumps({"items": []}))
+elif args[:2] == ["get", "job"]:
+    n = count("job")
+    print(json.dumps({"status": scenario["job"][min(n, len(scenario["job"]) - 1)]}))
+elif args[0] == "logs":
+    if "-f" in args:
+        sys.stdout.write(scenario["streamed_log"])
+elif args[0] in ("create", "apply"):
+    sys.stdin.read()
+"""
+
+
+class TestRun(unittest.TestCase):
+    """run() against a fake kubectl: what it creates, what it keeps, what it notices."""
+
+    def run_with(self, scenario):
+        tmp = tempfile.mkdtemp()
+        fake = Path(tmp, "kubectl")
+        fake.write_text(FAKE_KUBECTL)
+        fake.chmod(0o755)
+        Path(tmp, "scenario.json").write_text(json.dumps(scenario))
+        args = mock.Mock(image="img", tool="t", sizes="1,5", out=str(Path(tmp, "out")), cpu="4", memory="16Gi",
+                         cpu_limit="16", memory_limit="32Gi", shm=None, deadline=60)
+        env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", FAKE_KUBECTL_DIR=tmp)
+        with mock.patch.dict(os.environ, env), mock.patch.object(gp.time, "sleep", lambda _: None), \
+                mock.patch("builtins.print"):
+            try:
+                gp.run(args)
+            except SystemExit:
+                pass
+        calls = Path(tmp, "calls.log").read_text().splitlines()
+        out = Path(tmp, "out")
+        return calls, json.loads((out / "profile.json").read_text()), (out / "profile.md").read_text()
+
+    def own_pod(self):
+        p = pod("gpu-profile-t-1-abc", gpu=True)
+        p["metadata"]["labels"] = {"app": "gpu-profile"}
+        return p
+
+    def test_creates_rather_than_applies(self):
+        """Client-side apply copies the object into a 256 KiB annotation; inputs outgrow it."""
+        calls, _, _ = self.run_with({"pods": [[]], "job": [{"succeeded": 1}],
+                                     "streamed_log": 'PROFILE {"size": 1, "wall_s": 1, "exit_code": 0, "peak_rss_mib": 1}\n'})
+        self.assertTrue(any(c.startswith("create -f -") for c in calls))
+        self.assertFalse(any(c.startswith("apply") for c in calls))
+
+    def test_records_streamed_before_a_deadline_kill_are_kept(self):
+        """The Job controller deletes the pod at the deadline, so its log can't be read afterwards."""
+        log = ('PROFILE {"size": 1, "warmup": true, "wall_s": 1, "exit_code": 0, "peak_rss_mib": 1}\n'
+               'PROFILE {"size": 1, "wall_s": 1, "exit_code": 0, "peak_rss_mib": 1}\n')
+        _, profile, md = self.run_with({"pods": [[]], "job": [{}, {"failed": 1}], "streamed_log": log})
+        self.assertEqual([r["size"] for r in profile["records"] if not r.get("warmup")], [1])
+        self.assertIn("Did not finish: 5", md)
+
+    def test_a_gpu_job_that_starts_mid_run_taints_the_profile(self):
+        intruder = pod("cleandb-mepesm-x", runtime="nvidia")
+        _, profile, md = self.run_with({
+            "pods": [[], [self.own_pod()], [self.own_pod(), intruder]],
+            "job": [{}, {}, {"succeeded": 1}], "streamed_log": ""})
+        self.assertEqual(profile["contended_by"], ["ns/cleandb-mepesm-x: a Job using the GPU without requesting it"])
+        self.assertIn("cleandb-mepesm-x", md)
+
+    def test_its_own_pod_is_not_contention(self):
+        _, profile, md = self.run_with({"pods": [[], [self.own_pod()]], "job": [{}, {"succeeded": 1}],
+                                        "streamed_log": ""})
+        self.assertEqual(profile["contended_by"], [])
+        self.assertNotIn("contended", md.lower())
+
+
+class TestCgroupMemory(unittest.TestCase):
+    def test_peak_memory_comes_from_the_cgroup_so_workers_count(self):
+        """ru_maxrss is one process's peak; DataLoader workers and /dev/shm count against the cgroup."""
+        with tempfile.TemporaryDirectory() as tmp:
+            current = Path(tmp, "memory.current")
+            current.write_text(str(3 * 1024 ** 3))
+            with mock.patch.object(driver, "CGROUP_MEMORY_FILES", [str(current)]):
+                sampler = driver.MemorySampler(interval_s=0.01).start()
+                started = driver.time.monotonic()
+                driver.time.sleep(0.05)
+                current.write_text(str(18 * 1024 ** 3))
+                driver.time.sleep(0.05)
+                ended = driver.time.monotonic()
+                sampler.stop()
+            self.assertEqual(max(sampler.between(started, ended)), 18 * 1024)
+
+    def test_no_cgroup_file_means_not_measured(self):
+        with mock.patch.object(driver, "CGROUP_MEMORY_FILES", ["/nonexistent/memory.current"]):
+            sampler = driver.MemorySampler().start()
+            sampler.stop()
+        self.assertEqual(sampler.samples, [])
+
+
 if __name__ == "__main__":
     unittest.main()
