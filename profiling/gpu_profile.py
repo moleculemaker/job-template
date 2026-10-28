@@ -29,9 +29,10 @@ NAMESPACE = "staging"
 GPU_NODE_LABEL = "nvidia.com/gpu.present=true"
 GPU_RESOURCE = "nvidia.com/gpu"
 MULTIPLIERS = (1, 5, 10)
-PROFILE_LABEL = "gpu-profile"
 # A ConfigMap holds at most 1 MiB; leave room for the driver and metadata.
 CONFIGMAP_MAX_BYTES = 1_000_000
+# How long to wait for the log stream to end after the Job has.
+LOG_DRAIN_TIMEOUT_S = 120
 
 
 # --- What blocks a profiling run ------------------------------------------------------
@@ -94,11 +95,12 @@ def _kubectl_json(*args):
     return json.loads(out)
 
 
-def _other_pods():
-    """Every pod except our own profiling pods, which request the GPU too. Used only while
-    a run is going; before it, a leftover profiling pod still blocks."""
+def _other_pods(name):
+    """Every pod except this run's own, which requests the GPU too. Used only while the
+    run is going. The Job controller labels its pods job-name=<name>, so another
+    profiling run still counts as contention."""
     return [p for p in _kubectl_json("get", "pods", "--all-namespaces")["items"]
-            if (p["metadata"].get("labels") or {}).get("app") != PROFILE_LABEL]
+            if (p["metadata"].get("labels") or {}).get("job-name") != name]
 
 
 def check():
@@ -163,7 +165,7 @@ def _wait(name, poll_s=10):
         status = _kubectl_json("get", "job", name, "-n", NAMESPACE)["status"]
         if status.get("succeeded") or status.get("failed"):
             return bool(status.get("succeeded")), contended
-        contended += [b for b in gpu_blockers(_other_pods()) if b not in contended]
+        contended += [b for b in gpu_blockers(_other_pods(name)) if b not in contended]
         time.sleep(poll_s)
 
 
@@ -182,17 +184,27 @@ def run(args):
         # pod, and its log with it, so reading it afterwards would lose every record.
         logs = subprocess.Popen(["kubectl", "logs", "-f", f"job/{name}", "-n", NAMESPACE,
                                  f"--pod-running-timeout={args.deadline}s"],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         ok, contended = _wait(name)
-        log = logs.communicate(timeout=120)[0]
+        log_error = None
+        try:
+            log, err = logs.communicate(timeout=LOG_DRAIN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            logs.kill()
+            log, err = logs.communicate()
+            log_error = f"The log stream was still open {LOG_DRAIN_TIMEOUT_S} s after the Job ended (timed out); kept what had arrived."
+        if logs.returncode and not log_error:
+            # A failed attach (RBAC, the pod never started) would otherwise look like a run with no records.
+            log_error = f"kubectl logs exited {logs.returncode}: {err.strip()}"
     finally:
         subprocess.run(["kubectl", "delete", "job,configmap", name, "-n", NAMESPACE, "--wait=false"], check=False)
     records = parse_log(log)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "profile.json").write_text(json.dumps({"image": args.image, "tool": args.tool, "sizes": sizes,
-                                                  "contended_by": contended, "records": records}, indent=2) + "\n")
-    (out / "profile.md").write_text(report(records, args.image, sizes, contended))
+                                                  "contended_by": contended, "log_error": log_error,
+                                                  "records": records}, indent=2) + "\n")
+    (out / "profile.md").write_text(report(records, args.image, sizes, contended, log_error))
     print((out / "profile.md").read_text())
     if not ok:
         sys.exit("The profiling Job failed; records up to the failure are above.")
@@ -217,10 +229,12 @@ def fit(points):
     return fixed, per_item, (1 - ss_res / ss_tot) if ss_tot else 1.0
 
 
-def report(records, image, sizes=None, contended=()):
+def report(records, image, sizes=None, contended=(), log_error=None):
     """Markdown summary of a run: a row per size and the fitted fixed/per-item costs."""
     measured = [r for r in records if not r.get("warmup")]
     lines = [f"# Profile of `{image}`", ""]
+    if log_error:
+        lines += [f"**Log incomplete:** {log_error}", ""]
     if contended:
         lines += ["**Contended:** these GPU jobs ran during the profile, so later sizes may be inflated. "
                   "Re-run when the GPU is idle.", ""] + [f"- {c}" for c in contended] + [""]

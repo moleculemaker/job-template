@@ -241,6 +241,12 @@ elif args[:2] == ["get", "job"]:
 elif args[0] == "logs":
     if "-f" in args:
         sys.stdout.write(scenario["streamed_log"])
+        sys.stdout.flush()
+        if scenario.get("logs_hang"):
+            import time; time.sleep(30)
+        if scenario.get("logs_error"):
+            sys.stderr.write(scenario["logs_error"])
+            sys.exit(1)
 elif args[0] in ("create", "apply"):
     sys.stdin.read()
 """
@@ -259,6 +265,7 @@ class TestRun(unittest.TestCase):
                          cpu_limit="16", memory_limit="32Gi", shm=None, deadline=60)
         env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", FAKE_KUBECTL_DIR=tmp)
         with mock.patch.dict(os.environ, env), mock.patch.object(gp.time, "sleep", lambda _: None), \
+                mock.patch.object(gp.time, "time", lambda: 1), mock.patch.object(gp, "LOG_DRAIN_TIMEOUT_S", 2), \
                 mock.patch("builtins.print"):
             try:
                 gp.run(args)
@@ -268,9 +275,9 @@ class TestRun(unittest.TestCase):
         out = Path(tmp, "out")
         return calls, json.loads((out / "profile.json").read_text()), (out / "profile.md").read_text()
 
-    def own_pod(self):
-        p = pod("gpu-profile-t-1-abc", gpu=True)
-        p["metadata"]["labels"] = {"app": "gpu-profile"}
+    def own_pod(self, job="gpu-profile-t-1"):
+        p = pod(f"{job}-abc", gpu=True)
+        p["metadata"]["labels"] = {"app": "gpu-profile", "job-name": job}
         return p
 
     def test_creates_rather_than_applies(self):
@@ -295,6 +302,24 @@ class TestRun(unittest.TestCase):
             "job": [{}, {}, {"succeeded": 1}], "streamed_log": ""})
         self.assertEqual(profile["contended_by"], ["ns/cleandb-mepesm-x: a Job using the GPU without requesting it"])
         self.assertIn("cleandb-mepesm-x", md)
+
+    def test_another_profiling_run_is_contention(self):
+        _, profile, _ = self.run_with({"pods": [[], [self.own_pod(), self.own_pod("gpu-profile-other-9")]],
+                                       "job": [{}, {"succeeded": 1}], "streamed_log": ""})
+        self.assertEqual(profile["contended_by"], ["ns/gpu-profile-other-9-abc: holds the GPU"])
+
+    def test_a_failed_log_attach_is_reported_not_swallowed(self):
+        _, profile, md = self.run_with({"pods": [[]], "job": [{"succeeded": 1}], "streamed_log": "",
+                                        "logs_error": "error: pods is forbidden"})
+        self.assertIn("forbidden", profile["log_error"])
+        self.assertIn("forbidden", md)
+
+    def test_a_log_stream_that_outlives_the_job_is_killed_and_what_arrived_is_kept(self):
+        log = 'PROFILE {"size": 1, "wall_s": 1, "exit_code": 0, "peak_rss_mib": 1}\n'
+        _, profile, md = self.run_with({"pods": [[]], "job": [{"succeeded": 1}], "streamed_log": log,
+                                        "logs_hang": True})
+        self.assertEqual([r["size"] for r in profile["records"]], [1])
+        self.assertIn("timed out", profile["log_error"])
 
     def test_its_own_pod_is_not_contention(self):
         _, profile, md = self.run_with({"pods": [[], [self.own_pod()]], "job": [{}, {"succeeded": 1}],

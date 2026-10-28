@@ -24,7 +24,9 @@ python3 gpu_profile.py run    --image ghcr.io/<org>/<tool>-job:sha-<short> --too
 refuses to start if anything blocks (below). Then it creates one ConfigMap and one Job in
 `staging`, follows the pod log as records arrive, deletes both, and writes
 `out-<tool>/profile.json` and `profile.md`. Records already printed survive a deadline
-kill; `profile.md` lists the sizes that didn't finish. You need kubectl access to mmli2 with
+kill; `profile.md` lists the sizes that didn't finish. If the log stream fails to attach
+or is still open two minutes after the Job ends, `profile.md` says so (`log_error` in
+`profile.json`) and keeps whatever arrived. You need kubectl access to mmli2 with
 create/delete on Jobs and ConfigMaps in `staging`.
 
 `--cpu` and `--memory` are requests, and `--cpu-limit` and `--memory-limit` are limits.
