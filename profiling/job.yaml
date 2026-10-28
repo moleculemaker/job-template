@@ -1,0 +1,81 @@
+# Profiling run for a <tool>-job image on the mmli2 GPU node. Rendered and created by
+# gpu_profile.py, which fills in the dollar-sign placeholders. Mirrors how mmli-backend launches a GPU tool
+# (app/services/templates/job.tpl.yaml plus the ezspec-*/ml-simplefold values): the same
+# node selector, toleration, runtime class, GPU request, root user, cache mount and
+# environment, and /dev/shm only when asked for (the backend's shmSizeLimit). The command
+# assumes the template's ENTRYPOINT, `python -m wrapper.entrypoint`; if a tool's image
+# changes it (to activate a conda env, say), change the command to match. Not mirrored:
+# the backend's init and post-job containers, which only move files to and from MinIO.
+# Here the inputs come from the ConfigMap and the measurements go to the pod log.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    app: gpu-profile
+data:
+${configmap_data}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    app: gpu-profile
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: ${deadline}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: gpu-profile
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      containers:
+        - name: job
+          image: ${image}
+          imagePullPolicy: Always
+          command: ["python", "/profile/driver.py"]
+          env:
+            - name: JOB_TYPE
+              value: "${tool}"
+            # utility puts nvidia-smi in the container, which the driver samples for VRAM
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+          resources:
+            limits:
+              cpu: "${cpu_limit}"
+              memory: "${memory_limit}"
+              nvidia.com/gpu: "1"
+            requests:
+              cpu: "${cpu}"
+              memory: "${memory}"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: profile
+              mountPath: /profile
+            # The tool's weight cache, as the backend mounts it (job-template README)
+            - name: shared-storage
+              mountPath: /root/.cache
+              subPath: uws/jobs/${tool}/.cache
+${shm_mount}      volumes:
+        - name: profile
+          configMap:
+            name: ${name}
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: mmli-shared-job-data
+${shm_volume}
